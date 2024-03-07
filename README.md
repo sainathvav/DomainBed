@@ -73,9 +73,10 @@ Send us a PR to add your dataset! Any custom image dataset with folder structure
 
 Download the datasets:
 
+
 ```sh
-python3 -m domainbed.scripts.download \
-       --data_dir=./domainbed/data
+
+python3 -m domainbed.scripts.download --data_dir=./domainbed/data
 ```
 
 Train a model:

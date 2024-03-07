@@ -12,14 +12,17 @@ import uuid
 import numpy as np
 import PIL
 import torch
+import torch.nn as nn
 import torchvision
 import torch.utils.data
 
-from domainbed import datasets
-from domainbed import hparams_registry
-from domainbed import algorithms
-from domainbed.lib import misc
-from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
+
+import datasets
+
+import hparams_registry
+import algorithms
+from lib import misc
+from lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
@@ -37,9 +40,9 @@ if __name__ == "__main__":
         'random_hparams).')
     parser.add_argument('--seed', type=int, default=0,
         help='Seed for everything else')
-    parser.add_argument('--steps', type=int, default=None,
+    parser.add_argument('--steps', type=int, default=200,
         help='Number of steps. Default is dataset-dependent.')
-    parser.add_argument('--checkpoint_freq', type=int, default=None,
+    parser.add_argument('--checkpoint_freq', type=int, default=10,
         help='Checkpoint every N steps. Default is dataset-dependent.')
     parser.add_argument('--test_envs', type=int, nargs='+', default=[0])
     parser.add_argument('--output_dir', type=str, default="train_output")
@@ -47,7 +50,14 @@ if __name__ == "__main__":
     parser.add_argument('--uda_holdout_fraction', type=float, default=0,
         help="For domain adaptation, % of test to use unlabeled for training.")
     parser.add_argument('--skip_model_save', action='store_true')
-    parser.add_argument('--save_model_every_checkpoint', action='store_true')
+    parser.add_argument('--save_model_every_checkpoint', action='store_true', default= True)
+
+
+    ##### New arguments 
+    parser.add_argument('--KD', type=int, default=0)
+    parser.add_argument('--teacher_model_path', type=str, default="")
+    parser.add_argument('--model_name', type=str, default="model") 
+
     args = parser.parse_args()
 
     # If we ever want to implement checkpointing, just persist these values
@@ -65,6 +75,7 @@ if __name__ == "__main__":
     print("\tTorchvision: {}".format(torchvision.__version__))
     print("\tCUDA: {}".format(torch.version.cuda))
     print("\tCUDNN: {}".format(torch.backends.cudnn.version()))
+    print("\tNumber of devices: {}".format(torch.cuda.device_count()))
     print("\tNumPy: {}".format(np.__version__))
     print("\tPIL: {}".format(PIL.__version__))
 
@@ -101,13 +112,17 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
+    ###
+    ### Datasets and Dataloaders
+    ###
+
     # Split each env into an 'in-split' and an 'out-split'. We'll train on
     # each in-split except the test envs, and evaluate on all splits.
 
     # To allow unsupervised domain adaptation experiments, we split each test
     # env into 'in-split', 'uda-split' and 'out-split'. The 'in-split' is used
     # by collect_results.py to compute classification accuracies.  The
-    # 'out-split' is used by the Oracle model selectino method. The unlabeled
+    # 'out-split' is used by the Oracle model selection method. The unlabeled
     # samples in 'uda-split' are passed to the algorithm at training time if
     # args.task == "domain_adaptation". If we are interested in comparing
     # domain generalization and domain adaptation results, then domain
@@ -163,6 +178,7 @@ if __name__ == "__main__":
         batch_size=64,
         num_workers=dataset.N_WORKERS)
         for env, _ in (in_splits + out_splits + uda_splits)]
+    
     eval_weights = [None for _, weights in (in_splits + out_splits + uda_splits)]
     eval_loader_names = ['env{}_in'.format(i)
         for i in range(len(in_splits))]
@@ -171,14 +187,42 @@ if __name__ == "__main__":
     eval_loader_names += ['env{}_uda'.format(i)
         for i in range(len(uda_splits))]
 
-    algorithm_class = algorithms.get_algorithm_class(args.algorithm)
-    algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
-        len(dataset) - len(args.test_envs), hparams)
 
-    if algorithm_dict is not None:
-        algorithm.load_state_dict(algorithm_dict)
+    ###
+    ### Creating models
+    ###
+
+    ## Loading the teacher model
+    teacher_model = None
+    algorithm_class = None
+    algorithm = None
+
+    if (args.KD) :
+        teacher_model_class = algorithms.get_algorithm_class(args.algorithm)
+        teacher_model = teacher_model_class(dataset.input_shape, dataset.num_classes,
+            len(dataset) - len(args.test_envs), hparams)
+        teacher_model.load_state_dict(torch.load(args.teacher_model_path)["model_dict"])
+        teacher_model.eval()
+        teacher_model.to(device)
+
+        student_hparams = hparams.copy()
+        student_hparams["resnet18"] = True
+        student_hparams["temperature"] = 1.0
+
+        algorithm_class = algorithms.get_algorithm_class('Student')
+        algorithm = algorithm_class(dataset.input_shape, dataset.num_classes, 
+            len(dataset) - len(args.test_envs), teacher_model, student_hparams)
+
+    else : 
+        algorithm_class = algorithms.get_algorithm_class(args.algorithm)
+        algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
+            len(dataset) - len(args.test_envs), hparams)
+
+        if algorithm_dict is not None:
+            algorithm.load_state_dict(algorithm_dict)
 
     algorithm.to(device)
+
 
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
@@ -194,7 +238,7 @@ if __name__ == "__main__":
             return
         save_dict = {
             "args": vars(args),
-            "model_input_shape": dataset.input_shape,
+            "model_input_shape": dataset.input_shape, 
             "model_num_classes": dataset.num_classes,
             "model_num_domains": len(dataset) - len(args.test_envs),
             "model_hparams": hparams,
@@ -204,6 +248,11 @@ if __name__ == "__main__":
 
 
     last_results_keys = None
+
+    ###
+    ###  Training starts
+    ###
+
     for step in range(start_step, n_steps):
         step_start_time = time.time()
         minibatches_device = [(x.to(device), y.to(device))
@@ -232,7 +281,7 @@ if __name__ == "__main__":
             for name, loader, weights in evals:
                 acc = misc.accuracy(algorithm, loader, weights, device)
                 results[name+'_acc'] = acc
-
+            print("Acc==",acc)
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
 
             results_keys = sorted(results.keys())
@@ -256,9 +305,9 @@ if __name__ == "__main__":
             checkpoint_vals = collections.defaultdict(lambda: [])
 
             if args.save_model_every_checkpoint:
-                save_checkpoint(f'model_step{step}.pkl')
+                save_checkpoint(f'{args.model_name}_step_{step}.pkl')
 
-    save_checkpoint('model.pkl')
+    save_checkpoint(f'{args.model_name}.pkl')
 
     with open(os.path.join(args.output_dir, 'done'), 'w') as f:
         f.write('done')

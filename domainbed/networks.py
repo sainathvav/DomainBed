@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models
 
-from domainbed.lib import wide_resnet
+from lib import wide_resnet
 import copy
 
 
@@ -71,10 +71,10 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams['resnet18']:
-            self.network = torchvision.models.resnet18(pretrained=True)
+            self.network = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)
             self.n_outputs = 512
         else:
-            self.network = torchvision.models.resnet50(pretrained=True)
+            self.network = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
             self.n_outputs = 2048
 
         # self.network = remove_batch_norm_from_resnet(self.network)

@@ -14,8 +14,8 @@ try:
 except:
     backpack = None
 
-from domainbed import networks
-from domainbed.lib.misc import (
+import networks
+from lib.misc import (
     random_pairs_of_minibatches, split_meta_train_test, ParamDict,
     MovingAverage, l2_between_dicts, proj, Nonparametric
 )
@@ -52,6 +52,7 @@ ALGORITHMS = [
     'CausIRL_CORAL',
     'CausIRL_MMD',
     'EQRM',
+    'Student'
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -117,6 +118,57 @@ class ERM(Algorithm):
         return {'loss': loss.item()}
 
     def predict(self, x):
+        return self.network(x)
+
+class Student(Algorithm) :
+    def __init__(self, input_shape, num_classes, num_domains, teacher_model, hparams):
+        super(Student, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+
+        self.network = nn.Sequential(self.featurizer, self.classifier)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+        ## Additional parameters for Knowledge Distillation
+        self.teacher_model = teacher_model
+        self.temperature = self.hparams['temperature']
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model.predict(all_x)
+
+        student_outputs = self.network(all_x)
+
+        soft_teacher_outputs = torch.softmax(teacher_outputs / self.temperature, dim=1)
+        soft_student_outputs = torch.softmax(student_outputs / self.temperature, dim=1)
+
+        criterion = torch.nn.KLDivLoss(reduction="batchmean")
+        
+        loss_kld = criterion(torch.log(soft_student_outputs), soft_teacher_outputs)
+        loss_ce = F.cross_entropy(student_outputs, all_y)
+
+        loss = loss_kld * self.temperature * self.temperature + loss_ce
+
+        print(loss_kld, loss_ce)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def predict (self, x) :
         return self.network(x)
 
 
