@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
-
+from torch import nn
 import copy
 import numpy as np
 from collections import OrderedDict
@@ -22,7 +22,7 @@ from lib.misc import (
 
 
 ALGORITHMS = [
-    'ERM',
+    'ERM', 'ERM_AUX'
     'Fish',
     'IRM',
     'GroupDRO',
@@ -52,7 +52,7 @@ ALGORITHMS = [
     'CausIRL_CORAL',
     'CausIRL_MMD',
     'EQRM',
-    'Student'
+    'Student','Student_wt'
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -119,8 +119,320 @@ class ERM(Algorithm):
 
     def predict(self, x):
         return self.network(x)
+    
+
+class ERM_AUX(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(ERM_AUX, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
+
+        self.model = networks.AuxResNet18(num_classes)
+        for param in self.model.base_model.parameters():
+            param.requires_grad = False
+
+        self.model.network.eval()
+
+        #self.classifier = base_model.classifier
+        self.optimizer = torch.optim.Adam([
+            {'params': self.model.aux1.parameters()},
+            {'params': self.model.aux2.parameters()},
+            {'params': self.model.aux3.parameters()},
+            {'params': self.model.classifier.parameters()}],
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay'])
+        
+        # self.optimizer = torch.optim.Adam(
+        #     self.parameters(),
+        #     lr=self.hparams["lr"],
+        #     weight_decay=self.hparams['weight_decay']
+        # )
+    def update(self, minibatches, weights, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model.predict(all_x)
+
+        output_e1, output_e2, output_e3, output = self.model(all_x)
+
+        soft_teacher_outputs = torch.softmax(teacher_outputs / self.temperature, dim=1)
+        soft_student_outputs = torch.softmax(output / self.temperature, dim=1)
+
+        criterion = torch.nn.KLDivLoss(reduction="batchmean")
+        
+        loss_kld = criterion(torch.log(soft_student_outputs), soft_teacher_outputs)
+        loss_ce = F.cross_entropy(output, all_y)
+ 
+        loss = loss_kld * self.temperature * self.temperature + weights*loss_ce
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def update_aux(self, minibatches, unlabeled=None) :
+        self.model.train()
+        
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        output_e1, output_e2, output_e3, output = self.model(all_x)
+        loss = F.cross_entropy(output_e1, all_y) + F.cross_entropy(output_e2, all_y) + F.cross_entropy(output_e3, all_y) #+  F.cross_entropy(output, all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+    def predict (self, x) :
+        output_e1, output_e2, output_e3, output = self.model(x)
+        return output_e1, output_e2, output_e3, output
+
+class AUX_ERM(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(AUX_ERM, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
+
+        self.model = networks.Aux_ResNet18(num_classes, hparams["base_model_path"])
+        self.forecasting_classifier = networks.forecasting_classifier(4 * num_classes, 64)
+
+
+
+        ## Freeze the main network
+        for param in self.model.network.parameters():
+            param.requires_grad = False
+        
+        for param in self.model.classifier.parameters() : 
+            param.requires_grad = False
+
+        #self.classifier = base_model.classifier
+        self.optimizer = torch.optim.Adam([
+                {'params': self.model.aux_conv_1.parameters()},
+                {'params': self.model.aux_fc_1.parameters()},
+                {'params': self.model.aux_conv_2.parameters()},
+                {'params': self.model.aux_fc_2.parameters()},
+                {'params': self.model.aux_conv_3.parameters()},
+                {'params': self.model.aux_fc_3.parameters()},
+                {'params': self.forecasting_classifier.parameters()}
+            ],
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+        def set_bn_track_running_stats_false(model):
+            for module in model.modules():
+                if (isinstance(module, nn.BatchNorm2d)):
+                    module.track_running_stats = False
+
+        set_bn_track_running_stats_false(self.model.network)
+
+        # for layer in self.model.network.named_modules() : 
+        #     print(layer)
+
+        # for name, param in self.named_parameters() : 
+        #     # if param.requires_grad : 
+        #     if ("bn" in name) : 
+        #         print(name)
+    
+    def update(self, minibatches, unlabeled=None) :
+        self.model.train()
+        
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        output_e1, output_e2, output_e3, output = self.model(all_x)
+        
+        correctness = (torch.argmax(output, dim=1) == all_y)
+        correctness = correctness.type(torch.int64)
+
+        forecasting_input = torch.cat((output_e1, output_e2, output_e3, output), dim=1)
+        forecasting_output = self.forecasting_classifier(forecasting_input)
+
+        loss = F.cross_entropy(output_e1, all_y) + F.cross_entropy(output_e2, all_y) + F.cross_entropy(output_e3, all_y) \
+                + F.cross_entropy(forecasting_output, correctness)
+
+        # print(loss)
+
+        initial_weights = {}
+        final_weights = {}
+        for name, param in self.named_parameters() : 
+            initial_weights[name] = param.clone()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        for name, param in self.named_parameters() : 
+            final_weights[name] = param
+
+        # for name in initial_weights.keys() : 
+        #     print(name)
+        #     print(final_weights[name] - initial_weights[name])
+
+        return {'loss': loss.item()}
+    def update_aux(self, minibatches, unlabeled=None) :
+        self.model.train()
+        
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        output_e1, output_e2, output_e3, output = self.model(all_x)
+        loss = F.cross_entropy(output_e1, all_y) + F.cross_entropy(output_e2, all_y) + F.cross_entropy(output_e3, all_y) #+  F.cross_entropy(output, all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def predict (self, x) :
+        output_e1, output_e2, output_e3, output = self.model(x)
+
+        forecasting_input = torch.cat((output_e1, output_e2, output_e3, output), dim=1)
+        forecasting_output = self.forecasting_classifier(forecasting_input)
+
+        return output_e1, output_e2, output_e3, output, forecasting_output
+
+class AUX_Student(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, teacher_model, hparams):
+        super(AUX_Student, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
+
+        ## Here, we initialise a pre-trained ResNet18 model with some added auxiliary classifiers
+        self.model = networks.Aux_ResNet18(num_classes, None)
+        self.forecasting_classifier = networks.forecasting_classifier(4 * num_classes, 64)
+        self.temperature = 2
+        self.teacher_model = teacher_model
+        self.optimizer_1 = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+        self.optimizer_2 = torch.optim.Adam([
+                {'params': self.model.aux_conv_1.parameters()},
+                {'params': self.model.aux_fc_1.parameters()},
+                {'params': self.model.aux_conv_2.parameters()},
+                {'params': self.model.aux_fc_2.parameters()},
+                {'params': self.model.aux_conv_3.parameters()},
+                {'params': self.model.aux_fc_3.parameters()},
+                {'params': self.forecasting_classifier.parameters()}
+            ],
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+    
+    def update(self, minibatches,wt , unlabeled=None) :
+        self.model.train()
+        # for name, param in self.model.named_parameters() : 
+        #     if ("aux" in name) : 
+        #         param.requires_grad = False
+
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        
+        wt_1 = wt[:, 1].unsqueeze(1)
+        wt_0 = wt[:, 0].unsqueeze(1)
+
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model.predict(all_x)
+
+        output_e1, output_e2, output_e3, student_outputs = self.model(all_x)
+        # print(student_outputs)
+        # print("student_outputs",student_outputs.requires_grad)
+        soft_teacher_outputs = torch.softmax(teacher_outputs / self.temperature, dim=1)
+        soft_student_outputs = torch.softmax(student_outputs / self.temperature, dim=1)
+
+        criterion = torch.nn.KLDivLoss()
+        loss_kld = torch.mean( criterion(torch.log(soft_student_outputs), soft_teacher_outputs))
+        # print("loss KD :::" , loss_kld)
+        
+        loss_kld = torch.mean(wt_0 * criterion(torch.log(soft_student_outputs), soft_teacher_outputs))
+        # print("loss KD wt :::", loss_kld)
+        criterion_ce = nn.CrossEntropyLoss()
+        loss_ce =  torch.mean(criterion_ce(student_outputs, all_y))
+        # print("loss CE :::",loss_ce)
+        loss_ce =  torch.mean(wt_1 * criterion_ce(student_outputs, all_y))
+        # print("loss CE wt :::",loss_ce)
+        loss = loss_kld * self.temperature * self.temperature + loss_ce
+        #loss = 0.5*loss_kld + 0.5*loss_ce
+
+        self.optimizer_1.zero_grad()
+        loss.backward()
+        self.optimizer_1.step()
+
+        return {'loss': loss.item()}        
+
+    def aux_update(self, minibatches, unlabeled=None) :
+        self.model.train()
+        self.forecasting_classifier.train()
+
+        # for name, param in self.model.named_parameters() : 
+        #     if ("aux" in name) : 
+        #         param.requires_grad = True
+
+        # for param in self.model.network.parameters():
+        #     param.requires_grad = False
+        
+        # for param in self.model.classifier.parameters() : 
+        #     param.requires_grad = False
+
+
+        # def set_bn_track_running_stats_false(model):
+        #     for module in model.modules():
+        #         if (isinstance(module, nn.BatchNorm2d)):
+        #             module.track_running_stats = False
+
+        # ### Freezing the batchnorm statistics
+        # set_bn_track_running_stats_false(self.model.network)
+
+        
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        # for name, param in self.model.named_parameters() :  
+        #     print(name, param.requires_grad)
+
+        output_e1, output_e2, output_e3, output = self.model(all_x)
+        
+        # print("e1:::")
+        # print(output_e1)
+        # print("e2:::")
+        # print(output_e2)
+        # print("e3:::")
+        # print(output_e3)
+        # print("output:::")
+        # print(output)
+        correctness = (torch.argmax(output, dim=1) == all_y)
+        correctness = correctness.type(torch.int64)
+
+        #forecasting_input = torch.cat((output_e1, output_e2, output_e3, output), dim=1)
+        #forecasting_output = self.forecasting_classifier(forecasting_input)
+        # loss = None
+        #print(output_e1.requires_grad, output_e2.requires_grad, output_e3.requires_grad)
+        # print("LLLLLLLLLLLLLLL",output.requires_grad)
+        loss = F.cross_entropy(output_e1, all_y) + F.cross_entropy(output_e2, all_y) + F.cross_entropy(output_e3, all_y) 
+        #print(loss)
+        self.optimizer_2.zero_grad()
+        loss.backward()
+        self.optimizer_2.step()
+        #print("LOSS backward AUX")
+        return {'loss': loss.item()}
+
+    def predict (self, x) :
+
+        output_e1, output_e2, output_e3, output = self.model(x)
+
+        # forecasting_input = torch.cat((output_e1, output_e2, output_e3, output), dim=1)
+        # forecasting_output = self.forecasting_classifier(forecasting_input)
+
+        return output_e1, output_e2, output_e3, output  
 
 class Student(Algorithm) :
+    """
+    Knowledge Distillation
+    """
     def __init__(self, input_shape, num_classes, num_domains, teacher_model, hparams):
         super(Student, self).__init__(input_shape, num_classes, num_domains,
                                   hparams)
@@ -160,7 +472,59 @@ class Student(Algorithm) :
 
         loss = loss_kld * self.temperature * self.temperature + loss_ce
 
-        print(loss_kld, loss_ce)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def predict (self, x) :
+        return self.network(x) 
+
+
+class Student_wt(Algorithm) :
+    """
+    Knowledge Distillation
+    """
+    def __init__(self, input_shape, num_classes, num_domains, teacher_model, hparams):
+        super(Student_wt, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+
+        self.network = nn.Sequential(self.featurizer, self.classifier)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+        ## Additional parameters for Knowledge Distillation
+        self.teacher_model = teacher_model
+        self.temperature = self.hparams['temperature']
+
+    def update(self, minibatches, weights, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model.predict(all_x)
+
+        student_outputs = self.network(all_x)
+
+        soft_teacher_outputs = torch.softmax(teacher_outputs / self.temperature, dim=1)
+        soft_student_outputs = torch.softmax(student_outputs / self.temperature, dim=1)
+
+        criterion = torch.nn.KLDivLoss(reduction="batchmean")
+        
+        loss_kld = criterion(torch.log(soft_student_outputs), soft_teacher_outputs)
+        loss_ce = F.cross_entropy(student_outputs, all_y)
+ 
+        #loss = loss_kld * self.temperature * self.temperature + weights*loss_ce
+        loss = loss_kld * self.temperature * self.temperature + loss_ce
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -169,7 +533,99 @@ class Student(Algorithm) :
         return {'loss': loss.item()}
 
     def predict (self, x) :
-        return self.network(x)
+        return self.network(x) 
+    
+class ERM_EE(Algorithm):
+    """
+    Early Exits (Only for ResNet 50)
+    """
+    def __init__ (self, input_shape, num_classes, num_domains, base_model, hparams) :
+        super(ERM_EE, self).__init__(input_shape, num_classes, num_domains, 
+                                    hparams)
+        layers = list(base_model.featurizer.network.children())
+
+        self.conv1 = layers[0]
+        self.bn1 = layers[1]
+        self.relu1 = layers[2]
+
+        self.maxpool = layers[3]
+
+        self.layer1 = layers[4]
+        self.conv_e1 = nn.Conv2d(in_channels=256, out_channels=256, kernel_size=5, stride=4, padding=1)
+        self.avg_pool_e1 = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_e1 = nn.Linear(256, num_classes)
+
+
+        self.layer2 = layers[5]
+        self.conv_e2 = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=5, stride=4, padding=1)
+        self.avg_pool_e2 = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_e2 = nn.Linear(512, num_classes)
+
+        self.layer3 = layers[6]
+        self.conv_e3 = nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=3, stride=2, padding=1)
+        self.avg_pool_e3 = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_e3 = nn.Linear(1024, num_classes)
+
+        self.layer4 = layers[7]
+        self.avg_pool = layers[8]
+        
+        self.classifier = base_model.classifier
+
+        for name, param in self.named_parameters():
+            if "_e" in name:
+                param.requires_grad = True
+            else :
+                param.requires_grad = False
+
+        for name, param in self.named_parameters() :
+            if param.requires_grad :
+                print(name)
+
+        self.optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+    def update(self, minibatches, unlabeled=None) :
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        output_e1, output_e2, output_e3, output = self.predict(all_x)
+        loss = F.cross_entropy(output_e1, all_y) + F.cross_entropy(output_e2, all_y) + F.cross_entropy(output_e3, all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+
+    def predict(self, x) :
+        output = self.maxpool(self.relu1(self.bn1(self.conv1(x))))
+
+        output = self.layer1(output)
+        output_e1 = self.avg_pool_e1(self.conv_e1(output))
+        output_e1 = torch.flatten(output_e1, 1)
+        output_e1 = self.fc_e1(output_e1)
+
+        output = self.layer2(output)
+        output_e2 = self.avg_pool_e2(self.conv_e2(output))
+        output_e2 = torch.flatten(output_e2, 1)
+        output_e2 = self.fc_e2(output_e2)
+
+        output = self.layer3(output)
+        output_e3 = self.avg_pool_e3(self.conv_e3(output))
+        output_e3 = torch.flatten(output_e3, 1)
+        output_e3 = self.fc_e3(output_e3)
+
+        output = self.layer4(output)
+
+        output = self.avg_pool(output)
+        output = torch.flatten(output, 1)
+        output = self.classifier(output)
+
+        return output_e1, output_e2, output_e3, output
 
 
 class Fish(Algorithm):

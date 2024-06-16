@@ -28,6 +28,7 @@ DATASETS = [
     "TerraIncognita",
     "DomainNet",
     "SVIRO",
+    "NICO",
     # WILDS datasets
     "WILDSCamelyon",
     "WILDSFMoW",
@@ -54,7 +55,7 @@ def num_environments(dataset_name):
 class MultipleDomainDataset:
     N_STEPS = 5001           # Default, subclasses may override
     CHECKPOINT_FREQ = 100    # Default, subclasses may override
-    N_WORKERS = 8            # Default, subclasses may override
+    N_WORKERS = 1            # Default, subclasses may override
     ENVIRONMENTS = None      # Subclasses should override
     INPUT_SHAPE = None       # Subclasses should override
 
@@ -224,6 +225,9 @@ class MultipleEnvironmentImageFolder(MultipleDomainDataset):
         self.input_shape = (3, 224, 224,)
         self.num_classes = len(self.datasets[-1].classes)
 
+        ### Adding this to view the environment names
+        self.environments = environments
+
 class VLCS(MultipleEnvironmentImageFolder):
     CHECKPOINT_FREQ = 300
     ENVIRONMENTS = ["C", "L", "S", "V"]
@@ -249,7 +253,14 @@ class OfficeHome(MultipleEnvironmentImageFolder):
     CHECKPOINT_FREQ = 300
     ENVIRONMENTS = ["A", "C", "P", "R"]
     def __init__(self, root, test_envs, hparams):
-        self.dir = os.path.join(root, "office_home/")
+        self.dir = os.path.join(root, "OfficeHome/")
+        super().__init__(self.dir, test_envs, hparams['data_augmentation'], hparams)
+
+class NICO(MultipleEnvironmentImageFolder):
+    CHECKPOINT_FREQ = 300
+    ENVIRONMENTS = ["test", "train"]
+    def __init__(self, root, test_envs, hparams):
+        self.dir = os.path.join(root, "NICO/")
         super().__init__(self.dir, test_envs, hparams['data_augmentation'], hparams)
 
 class TerraIncognita(MultipleEnvironmentImageFolder):
